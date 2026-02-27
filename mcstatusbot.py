@@ -22,6 +22,7 @@ from enum import Enum
 import signal
 import atexit
 import discord
+from discord.ext import tasks
 import paramiko
 from dotenv import load_dotenv
 import os
@@ -254,147 +255,153 @@ async def post_status(channel: discord.TextChannel, status: Status, players: lis
     status_message = await channel.send(embed=build_status_embed(status, players))
 
 
+@tasks.loop(seconds=POLL_INTERVAL)
 async def monitor_loop():
     global current_status, last_mtime, current_players
 
-    await bot.wait_until_ready()
-    channel = bot.get_channel(DISCORD_CHANNEL_ID)
+    channel = bot.get_channel(int(DISCORD_CHANNEL_ID))
     if channel is None:
         log.error(f"Could not find Discord channel {DISCORD_CHANNEL_ID}")
         return
 
-    log.info("Monitor loop started.")
+    now = time.time()
 
-    # Clean up any status messages left over from a previous bot session
-    log.info("Scanning channel for old status messages to clean up...")
-    async for message in channel.history(limit=50):
+    # Run blocking SFTP call in a thread so it never freezes the event loop
+    result = await asyncio.to_thread(sftp_monitor.get_log_info)
+
+    if result is None:
+        log.warning("SFTP unreachable — keeping current state.")
+        return
+
+    mtime, log_tail = result
+    log_age = now - mtime
+    server_stopping = "Stopping server" in log_tail
+    log.debug(
+        f"Log age: {log_age:.1f}s | Stopping: {server_stopping} | State: {current_status.value}"
+    )
+
+    # ── OFFLINE ────────────────────────────────────────────────────────
+    if current_status == Status.OFFLINE:
         if (
-            message.author == bot.user
-            and message.embeds
-            and message.embeds[0].title
-            and any(message.embeds[0].title.startswith(p) for p in ("🔴", "🟡", "🟢"))
+            log_age < LOG_STALE_SECONDS
+            and (last_mtime is None or mtime != last_mtime)
+            and not server_stopping
         ):
-            try:
-                await message.delete()
-                log.info(f"Deleted old status message: {message.id}")
-            except discord.NotFound:
-                pass
+            log.info("Log activity detected → STARTING")
+            current_status = Status.STARTING
+            current_players = []
+            last_mtime = mtime
+            await post_status(channel, Status.STARTING, [])
 
-    await post_status(channel, current_status, current_players)
-
-    while not bot.is_closed():
-        now = time.time()
-
-        # Run blocking SFTP call in a thread so it never freezes the event loop
-        result = await asyncio.to_thread(sftp_monitor.get_log_info)
-
-        if result is None:
-            log.warning("SFTP unreachable — keeping current state.")
-            await asyncio.sleep(POLL_INTERVAL)
-            continue
-
-        mtime, log_tail = result
-        log_age = now - mtime
-        server_stopping = "Stopping server" in log_tail
-        log.debug(
-            f"Log age: {log_age:.1f}s | Stopping: {server_stopping} | State: {current_status.value}"
-        )
-
-        # ── OFFLINE ────────────────────────────────────────────────────────
-        if current_status == Status.OFFLINE:
-            if (
-                log_age < LOG_STALE_SECONDS
-                and (last_mtime is None or mtime != last_mtime)
-                and not server_stopping
-            ):
-                log.info("Log activity detected → STARTING")
-                current_status = Status.STARTING
-                current_players = []
-                last_mtime = mtime
-                await post_status(channel, Status.STARTING, [])
-
-        # ── STARTING ───────────────────────────────────────────────────────
-        elif current_status == Status.STARTING:
-            if server_stopping:
-                log.info("'Stopping server' detected during STARTING → OFFLINE")
-                current_status = Status.OFFLINE
-                current_players = []
-                last_mtime = mtime
-                await post_status(channel, Status.OFFLINE, [])
-            elif log_age > LOG_STALE_SECONDS:
-                log.info("Log went stale during STARTING → OFFLINE")
-                current_status = Status.OFFLINE
-                current_players = []
-                last_mtime = mtime
-                await post_status(channel, Status.OFFLINE, [])
-            else:
-                # Run blocking RCON call in a thread
-                success, count, names = await asyncio.to_thread(try_rcon_get_players)
-                if success:
-                    log.info(f"RCON up — {count} player(s) → ONLINE")
-                    current_status = Status.ONLINE
-                    current_players = names
-                    last_mtime = mtime
-                    await post_status(channel, Status.ONLINE, names)
-
-        # ── ONLINE ─────────────────────────────────────────────────────────
-        elif current_status == Status.ONLINE:
+    # ── STARTING ───────────────────────────────────────────────────────
+    elif current_status == Status.STARTING:
+        if server_stopping:
+            log.info("'Stopping server' detected during STARTING → OFFLINE")
+            current_status = Status.OFFLINE
+            current_players = []
+            last_mtime = mtime
+            await post_status(channel, Status.OFFLINE, [])
+        elif log_age > LOG_STALE_SECONDS:
+            log.info("Log went stale during STARTING → OFFLINE")
+            current_status = Status.OFFLINE
+            current_players = []
+            last_mtime = mtime
+            await post_status(channel, Status.OFFLINE, [])
+        else:
+            # Run blocking RCON call in a thread
             success, count, names = await asyncio.to_thread(try_rcon_get_players)
-
             if success:
-                joined = [p for p in names if p not in current_players]
-                left = [p for p in current_players if p not in names]
+                log.info(f"RCON up — {count} player(s) → ONLINE")
+                current_status = Status.ONLINE
+                current_players = names
+                last_mtime = mtime
+                await post_status(channel, Status.ONLINE, names)
 
-                for player in joined:
-                    log.info(f"Player joined: {player}")
-                    embed = discord.Embed(
-                        description=f"🟢  **{player}** joined the server",
-                        color=0x2ECC71,
-                    )
-                    await channel.send(embed=embed)
+    # ── ONLINE ─────────────────────────────────────────────────────────
+    elif current_status == Status.ONLINE:
+        success, count, names = await asyncio.to_thread(try_rcon_get_players)
 
-                for player in left:
-                    log.info(f"Player left: {player}")
-                    embed = discord.Embed(
-                        description=f"🔴  **{player}** left the server", color=0xE74C3C
-                    )
-                    await channel.send(embed=embed)
+        if success:
+            joined = [p for p in names if p not in current_players]
+            left = [p for p in current_players if p not in names]
 
-                if joined or left:
-                    current_players = names
-                    await post_status(channel, Status.ONLINE, names)
+            for player in joined:
+                log.info(f"Player joined: {player}")
+                embed = discord.Embed(
+                    description=f"🟢  **{player}** joined the server",
+                    color=0x2ECC71,
+                )
+                await channel.send(embed=embed)
 
-            else:
-                # RCON failed — fall back to log tail + mtime
-                log.warning("RCON down — falling back to log tail check")
-                if server_stopping or log_age > LOG_STALE_SECONDS:
-                    if server_stopping:
-                        log.info("'Stopping server' detected → OFFLINE")
-                    else:
-                        log.info(f"Log stale ({log_age:.0f}s) and RCON down → OFFLINE")
-                    for player in current_players:
-                        embed = discord.Embed(
-                            description=f"🔴  **{player}** left the server",
-                            color=0xE74C3C,
-                        )
-                        await channel.send(embed=embed)
-                    current_status = Status.OFFLINE
-                    current_players = []
-                    last_mtime = mtime
-                    await post_status(channel, Status.OFFLINE, [])
+            for player in left:
+                log.info(f"Player left: {player}")
+                embed = discord.Embed(
+                    description=f"🔴  **{player}** left the server", color=0xE74C3C
+                )
+                await channel.send(embed=embed)
+
+            if joined or left:
+                current_players = names
+                await post_status(channel, Status.ONLINE, names)
+
+        else:
+            # RCON failed — fall back to log tail + mtime
+            log.warning("RCON down — falling back to log tail check")
+            if server_stopping or log_age > LOG_STALE_SECONDS:
+                if server_stopping:
+                    log.info("'Stopping server' detected → OFFLINE")
                 else:
-                    log.info(
-                        f"Log fresh ({log_age:.0f}s), no stop signal — keeping ONLINE despite RCON failure"
+                    log.info(f"Log stale ({log_age:.0f}s) and RCON down → OFFLINE")
+                for player in current_players:
+                    embed = discord.Embed(
+                        description=f"🔴  **{player}** left the server",
+                        color=0xE74C3C,
                     )
+                    await channel.send(embed=embed)
+                current_status = Status.OFFLINE
+                current_players = []
+                last_mtime = mtime
+                await post_status(channel, Status.OFFLINE, [])
+            else:
+                log.info(
+                    f"Log fresh ({log_age:.0f}s), no stop signal — keeping ONLINE despite RCON failure"
+                )
 
-        last_mtime = mtime
-        await asyncio.sleep(POLL_INTERVAL)
+    last_mtime = mtime
 
 
 @bot.event
 async def on_ready():
     log.info(f"Logged in as {bot.user} (id: {bot.user.id})")
-    bot.loop.create_task(monitor_loop())
+
+    # Try to find the channel and clean up old messages before starting the loop
+    channel = bot.get_channel(int(DISCORD_CHANNEL_ID))
+    if channel is not None:
+        log.info("Scanning channel for old status messages to clean up...")
+        async for message in channel.history(limit=50):
+            if (
+                message.author == bot.user
+                and message.embeds
+                and message.embeds[0].title
+                and any(
+                    message.embeds[0].title.startswith(p) for p in ("🔴", "🟡", "🟢")
+                )
+            ):
+                try:
+                    await message.delete()
+                    log.info(f"Deleted old status message: {message.id}")
+                except discord.NotFound:
+                    pass
+
+        await post_status(channel, current_status, current_players)
+    else:
+        log.error(
+            f"Could not find Discord channel {DISCORD_CHANNEL_ID} during startup."
+        )
+
+    if not monitor_loop.is_running():
+        log.info("Starting monitor loop.")
+        monitor_loop.start()
 
 
 bot.run(DISCORD_TOKEN)

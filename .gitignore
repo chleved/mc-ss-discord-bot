@@ -1,1 +1,3 @@
 .env
+.geminiignore
+**/__pycache__/
