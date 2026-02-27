@@ -41,6 +41,8 @@ load_dotenv()
 
 SFTP_HOST = os.environ.get("SFTP_HOST")
 SFTP_PORT = os.environ.get("SFTP_PORT")
+if SFTP_PORT:
+    SFTP_PORT = int(SFTP_PORT)
 SFTP_USER = os.environ.get("SFTP_USER")
 SFTP_PASSWORD = os.environ.get("SFTP_PASSWORD")
 SFTP_KEY_PATH = os.environ.get("SFTP_KEY_PATH")
@@ -142,7 +144,7 @@ class SFTPMonitor:
             attrs = self._sftp.stat(DEBUG_LOG_PATH)
             mtime = float(attrs.st_mtime)
             size = attrs.st_size
-            tail_size = 8192  # 8KB — more than enough to catch "Stopping server"
+            tail_size = 4096  # 4KB — more than enough to catch "Stopping server"
             offset = max(0, size - tail_size)
             with self._sftp.open(DEBUG_LOG_PATH, "r") as f:
                 f.seek(offset)
@@ -276,7 +278,7 @@ async def monitor_loop():
     mtime, log_tail = result
     log_age = now - mtime
     server_stopping = "Stopping server" in log_tail
-    log.debug(
+    log.info(
         f"Log age: {log_age:.1f}s | Stopping: {server_stopping} | State: {current_status.value}"
     )
 
